@@ -1,0 +1,159 @@
+import pandas as pd
+import re
+import os
+import sys
+from openpyxl import load_workbook
+from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.utils import get_column_letter
+
+def expand_interface_range(interface):
+    match = re.match(r"^(\w+)(\d+)/(\d+)-(\d+)$", interface)
+    if match:
+        prefix, slot, start, end = match.groups()
+        return [f"{prefix}{slot}/{i}" for i in range(int(start), int(end) + 1)]
+    return [interface]
+
+def get_port_channel(interface):
+    match = re.search(r'\d+/(\d+)', interface)
+    return int(match.group(1)) if match else 0
+
+def is_valid_interface(interface):
+    return bool(re.match(r'^(eth|gi|twe|fo|hu|te|fa|ge|xe|et|mgmt)\d+/\d+$', str(interface), re.IGNORECASE))
+
+def is_valid_vlan(vlan):
+    return bool(re.match(r'^(\d+)(,\d+)*$', str(vlan)))
+
+def read_excel(filename):
+    if not os.path.exists(filename):
+        print(f"❌ Error: Input file '{filename}' not found.")
+        sys.exit(1)
+    df = pd.read_excel(filename, dtype=str)
+    df = df.fillna('')
+    return df.to_dict(orient='records')
+
+def generate_config(data):
+    config_output = []
+    processed_switches = {}
+    
+    for row in data:
+        switch_name = str(row.get('switch_name', '')).strip()
+        interfaces = expand_interface_range(str(row.get('interface', '')).strip())
+        hostnames = [h.strip() for h in str(row.get('hostname', '')).split(',') if h.strip()]
+        vlan = str(row.get('vlan', '')).strip()
+        config_type = str(row.get('config_type', '')).strip().lower()
+        vpc_id = str(row.get('vpc_id', '')).strip() if row.get('vpc_id') else ''
+
+        if not switch_name:
+            continue
+        if not all(is_valid_interface(iface) for iface in interfaces):
+            continue
+        if not is_valid_vlan(vlan):
+            continue
+
+        if len(hostnames) < len(interfaces):
+            hostnames.extend([f"Host-{iface}" for iface in interfaces[len(hostnames):]])
+
+        if switch_name not in processed_switches:
+            processed_switches[switch_name] = {
+                "show_commands": [
+                    f"Show command for switch_name: {switch_name}",
+                    "show logging",
+                    "show running-config",
+                    "show vlan",
+                    f"show vlan id {vlan}",
+                    "show interface status",
+                ],
+                "config": [
+                    f"Config for switch_name: {switch_name}\n",
+                    f"ssh {switch_name}",
+                    "conf t",
+                    "!",
+                ]
+            }
+        
+        for idx, interface in enumerate(interfaces):
+            hostname = hostnames[idx]
+            port_channel = get_port_channel(interface)
+            processed_switches[switch_name]["show_commands"].append(f"show running-config interface {interface}")
+            
+            config_lines = [
+                f"interface {interface}",
+                f" description {hostname}",
+                " switchport",
+            ]
+            
+            if config_type in ['normal-access', 'normal-trunk']:
+                config_lines.append(" switchport mode access" if 'access' in config_type else " switchport mode trunk")
+                config_lines.append(f" switchport access vlan {vlan}" if 'access' in config_type else f" switchport trunk allowed vlan add {vlan}")
+            elif config_type in ['port-channel-normal', 'port-channel-trunk', 'vpc-normal', 'vpc-trunk']:
+                port_channel_config = [
+                    f"interface port-channel {port_channel}",
+                    f" description {hostname}",
+                    " switchport",
+                    " switchport mode access" if 'normal' in config_type else " switchport mode trunk",
+                    f" switchport access vlan {vlan}" if 'normal' in config_type else f" switchport trunk allowed vlan add {vlan}",
+                ]
+                
+                if 'vpc' in config_type:
+                    port_channel_config.append(f" vpc {port_channel}")
+                
+                port_channel_config.append(" spanning-tree port type edge")
+                port_channel_config.append("!")
+                processed_switches[switch_name]["config"].extend(port_channel_config)
+                
+                config_lines.append(" switchport mode access" if 'normal' in config_type else " switchport mode trunk")
+                config_lines.append(f" switchport access vlan {vlan}" if 'normal' in config_type else f" switchport trunk allowed vlan add {vlan}")
+                config_lines.append(f" channel-group {port_channel} mode active")
+            
+            config_lines.append(" no shutdown")
+            config_lines.append("!")
+            processed_switches[switch_name]["config"].extend(config_lines)
+    
+    output = []
+    for switch, details in processed_switches.items():
+        output.append("\n".join(details["show_commands"]))
+        output.append("-" * 52)
+        output.append("\n".join(details["config"]))
+        output.append("end\nwr\n")
+    
+    return "\n".join(output)
+
+def add_dropdown_to_excel(filename):
+    valid_config_types = ["normal-access", "normal-trunk", "port-channel-normal", "port-channel-trunk", "vpc-normal", "vpc-trunk"]
+    wb = load_workbook(filename)
+    ws = wb.active
+
+    config_type_col = None
+    for col_num, col_cells in enumerate(ws.iter_cols(1, ws.max_column), start=1):
+        if col_cells[0].value == "config_type":
+            config_type_col = col_num
+            break
+    else:
+        wb.close()
+        return
+
+    col_letter = get_column_letter(config_type_col)
+    dv = DataValidation(type="list", formula1=f'"{",".join(valid_config_types)}"', allow_blank=True)
+    ws.add_data_validation(dv)
+
+    for row in range(2, ws.max_row + 1):
+        cell_ref = f"{col_letter}{row}"
+        dv.add(ws[cell_ref])
+
+    wb.save(filename)
+    wb.close()
+
+def main():
+    input_file = input("Enter the Excel file name (default: switch_ports.xlsx): ").strip()
+    if not input_file:
+        input_file = "switch_ports.xlsx"
+    add_dropdown_to_excel(input_file)
+    data = read_excel(input_file)
+    config = generate_config(data)
+    output_file = os.path.splitext(input_file)[0] + ".txt"
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write(config)
+    print(f"✅ Configuration saved to {output_file}")
+
+if __name__ == "__main__":
+    main()
